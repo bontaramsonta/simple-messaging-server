@@ -1,0 +1,21 @@
+{
+  "name": "simple-messaging-server",
+  "module": "main.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch main.ts",
+    "build": "bun build --target bun --minify --outdir dist --sourcemap=external main.ts",
+    "compile": "bun build --target bun --compile --outfile index --sourcemap=external main.ts",
+    "preview": "bun run dist/main.js"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "fast-jwt": "^3.2.0",
+    "redis": "^4.6.8"
+  }
+}
