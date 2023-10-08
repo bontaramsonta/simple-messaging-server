@@ -123,10 +123,17 @@ redis.once("ready", async () => {
     await redis.ft.DROPINDEX("idx:user");
   }
   const userIndexSchema: RediSearchSchema = {
-    username: { type: SchemaFieldTypes.TEXT, SORTABLE: true },
+    "$.username": {
+      AS: "username",
+      type: SchemaFieldTypes.TEXT,
+      SORTABLE: true,
+    },
   };
   try {
-    await redis.ft.CREATE("idx:user", userIndexSchema, { PREFIX: ["user:"] });
+    await redis.ft.CREATE("idx:user", userIndexSchema, {
+      PREFIX: "user",
+      ON: "JSON",
+    });
   } catch (err) {
     console.error("[user idx error]", err);
   }
@@ -139,17 +146,18 @@ redis.once("ready", async () => {
     await redis.ft.DROPINDEX("idx:message");
   }
   const messageIndexSchema: RediSearchSchema = {
-    content: { type: SchemaFieldTypes.TEXT },
-    from: { type: SchemaFieldTypes.TAG },
-    to: { type: SchemaFieldTypes.TAG },
-    date: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
-    context: { type: SchemaFieldTypes.TAG },
-    isDeleted: { type: SchemaFieldTypes.TAG },
-    isRead: { type: SchemaFieldTypes.TAG },
+    "$.content": { type: SchemaFieldTypes.TEXT, AS: "content" },
+    "$.from": { type: SchemaFieldTypes.TAG, AS: "from" },
+    "$.to": { type: SchemaFieldTypes.TAG, AS: "to" },
+    "$.date": { type: SchemaFieldTypes.NUMERIC, SORTABLE: true, AS: "date" },
+    "$.context": { type: SchemaFieldTypes.TAG, AS: "context" },
+    "$.isDeleted": { type: SchemaFieldTypes.TAG, AS: "isDeleted" },
+    "$.isRead": { type: SchemaFieldTypes.TAG, AS: "isRead" },
   };
   try {
     await redis.ft.CREATE("idx:message", messageIndexSchema, {
-      PREFIX: ["message:"],
+      PREFIX: "message",
+      ON: "JSON",
     });
   } catch (err) {
     console.error("[message idx error]", err);
@@ -171,7 +179,6 @@ type WSMessage =
       type: "message";
       context: MessageContext;
       to: string;
-      from: string;
       content: string;
       date: number;
     }
@@ -179,7 +186,6 @@ type WSMessage =
       type: "typing";
       context: MessageContext;
       to: string;
-      from: string;
     };
 
 const server = Bun.serve<WSData>({
@@ -231,8 +237,29 @@ const server = Bun.serve<WSData>({
       const user = await getUser(userId);
       return new Response(JSON.stringify(user));
     }
-    // get messages?context={context}&from={from}&to={to}
-    //?
+    // get messages?context={context}&from={from}&to={to}&skip={skip}&limit={limit}
+    if (req.method === "GET" && url.pathname === "/messages") {
+      const search = new URLSearchParams(url.search);
+      const context = search.get("context") as MessageContext;
+      const from = search.get("from") as string;
+      const to = search.get("to") as string;
+      const skip = search.get("skip") ?? ("0" as string);
+      const limit = search.get("limit") ?? ("10" as string);
+      const messages = await redis.ft.SEARCH(
+        "idx:message",
+        `@context:{${context}} @from:{${from}} @to:{${to}}`,
+        {
+          LIMIT: {
+            from: parseInt(skip),
+            size: parseInt(limit),
+          },
+          SORTBY: "date",
+        }
+      );
+      return new Response(JSON.stringify(messages), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     return new Response(`ok ${Date.now()}`);
   },
   websocket: {
@@ -273,17 +300,18 @@ const server = Bun.serve<WSData>({
         // send message event
         if (msg.type === "message") {
           // save message
-          const msgId = `${msg.context}:${msg.from}:${msg.to}:${Date.now()}`;
-          saveMessage({
+          const msgId = `${msg.context}:${ws.data.id}:${msg.to}:${Date.now()}`;
+          const message = {
             id: msgId,
-            from: msg.from,
+            from: ws.data.id,
             to: msg.to,
             content: msg.content,
-            date: msg.date,
+            date: Date.now(),
             context: msg.context,
             isDeleted: false,
             isRead: false,
-          });
+          };
+          saveMessage(message);
           if (msg.context === "dm") {
             console.log("sending dm to", msg.to);
             l(
@@ -291,10 +319,10 @@ const server = Bun.serve<WSData>({
                 `user:${msg.to}`,
                 JSON.stringify({
                   type: "message",
-                  id: msgId,
-                  from: ws.data.id,
-                  content: msg.content,
-                  date: msg.date,
+                  id: message.id,
+                  from: message.from,
+                  content: message.content,
+                  date: message.date,
                 })
               )
             );
@@ -305,10 +333,10 @@ const server = Bun.serve<WSData>({
                 `room:${msg.to}`,
                 JSON.stringify({
                   type: "message",
-                  id: msgId,
-                  from: ws.data.id,
-                  content: msg.content,
-                  date: Date.now(),
+                  id: message.id,
+                  from: message.from,
+                  content: message.content,
+                  date: message.date,
                 })
               )
             );
