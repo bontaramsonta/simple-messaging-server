@@ -1,12 +1,10 @@
 import { createSigner, createVerifier } from "fast-jwt";
-import { createClient } from "redis";
+import { RediSearchSchema, SchemaFieldTypes, createClient } from "redis";
 
 //util
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const l = (...args: any[]) => console.log("[MX]", ...args);
 // ---
-
-// types
 
 // jwt
 const tokenSigner = createSigner({
@@ -27,9 +25,7 @@ const tokenVerifier = createVerifier({
   complete: true,
 });
 
-function createToken(payload: {
-  id: string;
-}) {
+function createToken(payload: { id: string }) {
   return tokenSigner(payload);
 }
 function verifyToken(token: string) {
@@ -39,12 +35,6 @@ function verifyToken(token: string) {
 
 // redis
 const redis = createClient();
-redis.once("ready", () => {
-  console.log("redis connected");
-});
-redis.once("error", (err) => {
-  console.error("redis error", err);
-});
 
 type MessageContext = "dm" | "room";
 
@@ -70,51 +60,105 @@ interface User {
 }
 
 async function saveMessage(message: Message) {
-  return await redis.json.set(
-    `message:${message.id}`,
-    ".",
-    JSON.stringify(message),
-  );
+  //@ts-ignore - don't need to stringify obj before setting
+  return await redis.json.set(`message:${message.id}`, ".", message);
 }
 
 async function getMessage(id: string) {
-  return JSON.parse(await redis.json.get(`message:${id}`) as string) as Message;
+  return JSON.parse(
+    (await redis.json.get(`message:${id}`)) as string
+  ) as Message;
 }
 
 async function getUser(id: string) {
-  return JSON.parse(await redis.json.get(`user:${id}`) as string) as User;
+  const result = (await redis.json.get(`user:${id}`)) as unknown;
+  if (result) {
+    return result as User;
+  }
+  return null;
+}
+
+async function saveUser(user: User) {
+  //@ts-ignore - don't need to stringify obj before setting
+  return await redis.json.set(`user:${user.id}`, "$", user, {
+    NX: true,
+  });
 }
 
 async function insertUserIntoRoom(userId: string, roomId: string) {
-  return await redis.json.arrAppend(`user:${userId}`, ".rooms", roomId);
+  return await redis.json.arrAppend(`user:${userId}`, "$.rooms", roomId);
 }
 
 async function removeUserFromRoom(
   userId: string,
-  roomId: string,
+  roomId: string
 ): Promise<string | null> {
-  const index = await redis.json.arrIndex(`user:${userId}`, ".rooms", roomId);
+  const index = await redis.json.arrIndex(`user:${userId}`, "$.rooms", roomId);
   if (typeof index === "number") {
     console.log("roomId not found");
     return null;
   } else {
     console.log("index", index);
-    return await redis.json.arrPop(
+    return (await redis.json.arrPop(
       `user:${userId}`,
-      ".rooms",
-      index[0],
-    ) as string;
+      "$.rooms",
+      index[0]
+    )) as string;
   }
 }
 
 async function setUserOnlineStatus(userId: string, isOnline: boolean) {
-  return await redis.json.set(
-    `user:${userId}`,
-    ".isOnline",
-    isOnline,
-  );
+  return await redis.json.set(`user:${userId}`, ".isOnline", isOnline);
 }
 
+redis.once("ready", async () => {
+  console.log("redis connected");
+  // ensure indexes
+  let userIndexExists = false;
+  try {
+    userIndexExists = !!(await redis.ft.INFO("idx:user"));
+  } catch {}
+  console.log("[redis index] user exists", userIndexExists);
+  if (userIndexExists) {
+    await redis.ft.DROPINDEX("idx:user");
+  }
+  const userIndexSchema: RediSearchSchema = {
+    username: { type: SchemaFieldTypes.TEXT, SORTABLE: true },
+  };
+  try {
+    await redis.ft.CREATE("idx:user", userIndexSchema, { PREFIX: ["user:"] });
+  } catch (err) {
+    console.error("[user idx error]", err);
+  }
+  let messageIndexExists = false;
+  try {
+    messageIndexExists = !!(await redis.ft.INFO("idx:message"));
+  } catch {}
+  console.log("[redis index] message exists", messageIndexExists);
+  if (messageIndexExists) {
+    await redis.ft.DROPINDEX("idx:message");
+  }
+  const messageIndexSchema: RediSearchSchema = {
+    content: { type: SchemaFieldTypes.TEXT },
+    from: { type: SchemaFieldTypes.TAG },
+    to: { type: SchemaFieldTypes.TAG },
+    date: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
+    context: { type: SchemaFieldTypes.TAG },
+    isDeleted: { type: SchemaFieldTypes.TAG },
+    isRead: { type: SchemaFieldTypes.TAG },
+  };
+  try {
+    await redis.ft.CREATE("idx:message", messageIndexSchema, {
+      PREFIX: ["message:"],
+    });
+  } catch (err) {
+    console.error("[message idx error]", err);
+  }
+  // ---
+});
+redis.once("error", (err) => {
+  console.error("redis error", err);
+});
 await redis.connect();
 // ---
 
@@ -122,23 +166,24 @@ interface WSData {
   id: string;
 }
 
-type WSMessage = {
-  type: "message";
-  context: MessageContext;
-  to: string;
-  from: string;
-  content: string;
-  date: number;
-} | {
-  type: "typing";
-  context: MessageContext;
-  to: string;
-  from: string;
-};
+type WSMessage =
+  | {
+      type: "message";
+      context: MessageContext;
+      to: string;
+      from: string;
+      content: string;
+      date: number;
+    }
+  | {
+      type: "typing";
+      context: MessageContext;
+      to: string;
+      from: string;
+    };
 
 const server = Bun.serve<WSData>({
   async fetch(req, server) {
-    console.log("request", req.url);
     const url = new URL(req.url);
     if (url.pathname === "/chat") {
       const search = new URLSearchParams(req.url.split("?")[1]);
@@ -157,13 +202,37 @@ const server = Bun.serve<WSData>({
         : new Response("WebSocket upgrade error", { status: 400 });
     }
     //token create
-    if (req.method === "POST" && url.pathname === "/token") {
-      const body = await req.json(); // id
+    if (req.method === "POST" && url.pathname === "/signin") {
+      const body = await req.json(); // id, name, avatar?
+      // get user from db
+      let user = await getUser(body?.id);
+      console.log("[X]", user);
+      if (!user) {
+        // create user
+        user = {
+          id: body.id,
+          username: body.username,
+          avatar: body?.avatar,
+          rooms: [],
+          friends: [],
+          isOnline: false,
+          lastSeen: Date.now(),
+        };
+        await saveUser(user);
+      }
 
-      const token = createToken({ id: body.id });
+      const token = createToken({ id: user.id });
       return new Response(JSON.stringify({ token }));
     }
-
+    //get user?id={userId}
+    if (req.method === "GET" && url.pathname === "/user") {
+      const search = new URLSearchParams(url.search);
+      const userId = search.get("id")!;
+      const user = await getUser(userId);
+      return new Response(JSON.stringify(user));
+    }
+    // get messages?context={context}&from={from}&to={to}
+    //?
     return new Response(`ok ${Date.now()}`);
   },
   websocket: {
@@ -173,6 +242,7 @@ const server = Bun.serve<WSData>({
       try {
         // get user for db
         const user = await getUser(ws.data.id);
+        if (!user) return ws.close();
         console.log(`${user.username} has entered the chat`);
         ws.subscribe(`user:${user.id}`);
         // sub to rooms
@@ -186,9 +256,10 @@ const server = Bun.serve<WSData>({
               userId: user.id,
               username: user.username,
               avatar: user.avatar,
-            }),
+            })
           )
         );
+        setUserOnlineStatus(user.id, true);
       } catch (err) {
         console.error("[ws open error]", ws.data.id, err);
       }
@@ -215,49 +286,57 @@ const server = Bun.serve<WSData>({
           });
           if (msg.context === "dm") {
             console.log("sending dm to", msg.to);
-            l(ws.publish(
-              `user:${msg.to}`,
-              JSON.stringify({
-                type: "message",
-                id: msgId,
-                from: ws.data.id,
-                content: msg.content,
-                date: msg.date,
-              }),
-            ));
+            l(
+              ws.publish(
+                `user:${msg.to}`,
+                JSON.stringify({
+                  type: "message",
+                  id: msgId,
+                  from: ws.data.id,
+                  content: msg.content,
+                  date: msg.date,
+                })
+              )
+            );
           } else {
             console.log("sending room message to", msg.to);
-            l(ws.publish(
-              `room:${msg.to}`,
-              JSON.stringify({
-                type: "message",
-                id: msgId,
-                from: ws.data.id,
-                content: msg.content,
-                date: Date.now(),
-              }),
-            ));
+            l(
+              ws.publish(
+                `room:${msg.to}`,
+                JSON.stringify({
+                  type: "message",
+                  id: msgId,
+                  from: ws.data.id,
+                  content: msg.content,
+                  date: Date.now(),
+                })
+              )
+            );
           }
           // send typing event
         } else if (msg.type === "typing") {
           if (msg.context === "dm") {
             console.log("sending dm typing to", msg.to);
-            l(ws.publish(
-              `user:${msg.to}`,
-              JSON.stringify({
-                type: "typing",
-                from: ws.data.id,
-              }),
-            ));
+            l(
+              ws.publish(
+                `user:${msg.to}`,
+                JSON.stringify({
+                  type: "typing",
+                  from: ws.data.id,
+                })
+              )
+            );
           } else {
             console.log("sending room typing to", msg.to);
-            l(ws.publish(
-              `room:${msg.to}`,
-              JSON.stringify({
-                type: "typing",
-                from: ws.data.id,
-              }),
-            ));
+            l(
+              ws.publish(
+                `room:${msg.to}`,
+                JSON.stringify({
+                  type: "typing",
+                  from: ws.data.id,
+                })
+              )
+            );
           }
         }
       } catch (err) {
@@ -267,6 +346,7 @@ const server = Bun.serve<WSData>({
     //close ws
     async close(ws) {
       const user = await getUser(ws.data.id);
+      if (!user) return;
       console.log(`${user.username} has left the chat`);
       // set user offline
       setUserOnlineStatus(user.id, false);
@@ -277,7 +357,7 @@ const server = Bun.serve<WSData>({
           JSON.stringify({
             type: "user-offline",
             userId: user.id,
-          }),
+          })
         )
       );
     },
